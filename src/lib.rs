@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::thread::JoinHandle;
 
 use flume::{Sender, Receiver, SendError};
 
@@ -220,7 +221,7 @@ impl Context {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// Worker is a background thread executer that can listen to
 /// incoming tasks, store them in a local queue and process one
 /// by another. Size of the queue is configurable.
@@ -249,7 +250,8 @@ impl Context {
 /// }
 /// ```
 pub struct Worker {
-    task_sender: Sender<(Context, Task)>
+    task_sender: Sender<(Context, Task)>,
+    handle: JoinHandle<()>
 }
 
 impl Worker {
@@ -263,14 +265,15 @@ impl Worker {
     pub fn new(queue_size: usize) -> Self {
         let (task_sender, task_listener) = flume::bounded::<(Context, Task)>(queue_size);
 
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             while let Ok((context, task)) = task_listener.recv() {
                 task(context);
             }
         });
 
         Self {
-            task_sender
+            task_sender,
+            handle
         }
     }
 
@@ -296,6 +299,22 @@ impl Worker {
         }
 
         Ok(Some((context, task)))
+    }
+
+    #[inline]
+    /// Check if worker's thread can't receive tasks anymore.
+    /// This means that the connected tasks sending channel
+    /// was closed.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    #[inline]
+    /// Join worker's thread.
+    pub fn join(self) -> std::thread::Result<()> {
+        drop(self.task_sender);
+
+        self.handle.join()
     }
 }
 
@@ -417,6 +436,51 @@ impl Scheduler {
         self.context.schedule_exclusive(task)
     }
 
+    #[inline]
+    /// Check if there are any alive contexts of the current scheduler,
+    /// or if some tasks are buffered for execution, or if there are
+    /// scope reports which were not received and processed yet.
+    ///
+    /// Alive contexts can potentially can be used to spawn new
+    /// tasks, thus scheduler should be alive to process them.
+    ///
+    /// When `false` is returned, unless directly or if `context` method
+    /// is called, there's no way to spawn new tasks in the scheduler, thus
+    /// it's not alive. *It does not means you should stop updating it*.
+    /// It only means that you should write your own checks to decide
+    /// what to do now.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use miyabi_scheduler::*;
+    ///
+    /// // Create new scheduler with 1 worker.
+    /// let scheduler = Scheduler::new(1, 2);
+    ///
+    /// // Schedule it to execute this task (wait 1 second).
+    /// scheduler.schedule(Box::new(|_| {
+    ///     std::thread::sleep(std::time::Duration::from_secs(1));
+    /// })).unwrap();
+    ///
+    /// // Update scheduler while it's alive.
+    /// while scheduler.is_alive() {
+    ///     scheduler.update(|_| {}).unwrap();
+    /// }
+    ///
+    /// println!("All the tasks finished and I did not write any code to make new ones");
+    /// ```
+    pub fn is_alive(&self) -> bool {
+        // If there's an alive context out of the current struct or any number of buffered tasks.
+        self.task_listener.sender_count() > 1 || !self.task_listener.is_empty() ||
+
+        // If there's an alive context out of the current struct or any number of buffered lock tasks.
+        self.lock_listener.sender_count() > 1 || !self.lock_listener.is_empty() ||
+
+        // If there are some scope reports awaiting for processing.
+        !self.scope_listener.is_empty()
+    }
+
     /// Create new background thread, run scheduler updates there
     /// and return context of the current scheduler to spawn new tasks,
     /// and an abort function which, when called, will stop the thread.
@@ -454,6 +518,44 @@ impl Scheduler {
         });
 
         (context, abort)
+    }
+
+    #[inline]
+    /// Drop scheduler's context and listeners
+    /// and join all its workers' threads.
+    ///
+    /// Note that if the scheduler is alive (there are
+    /// tasks in the queue or if new ones can be spawned)
+    /// then this method will most likely block your thread
+    /// forever because workers will never close until
+    /// all the contexts are dropped.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// use miyabi_scheduler::*;
+    ///
+    /// // Create new scheduler with 1 worker.
+    /// let scheduler = Scheduler::new(1, 1);
+    ///
+    /// // Schedule task execution (wait for 1 second).
+    /// scheduler.schedule(Box::new(|_| {
+    ///     std::thread::sleep(std::time::Duration::from_secs(1));
+    /// })).unwrap();
+    ///
+    /// // Assign task to the worker.
+    /// scheduler.update(|_| {}).unwrap();
+    ///
+    /// // Join the scheduler (wait until all the workers are closed).
+    /// // We will wait until all the
+    /// scheduler.join();
+    /// ```
+    pub fn join(self) {
+        let Self { mut workers, .. } = self;
+
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 
     /// Try to read incoming task from the contexts
