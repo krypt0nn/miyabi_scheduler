@@ -1,0 +1,14 @@
+[package]
+name = "miyabi_scheduler"
+version = "0.1.0"
+description = "Thread pool scheduler with extra specific abilities"
+keywords = ["threads", "thread-pool", "scheduler"]
+categories = ["concurrency"]
+authors = ["Nikita Podvirnyi <krypt0nn@vk.com>"]
+homepage = "https://github.com/krypt0nn/miyabi_scheduler"
+repository = "https://github.com/krypt0nn/miyabi_scheduler"
+license = "MIT"
+edition = "2021"
+
+[dependencies]
+flume = "0.11"
