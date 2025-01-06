@@ -35,7 +35,7 @@ use super::prelude::*;
 /// let context = scheduler.context();
 ///
 /// // Run scheduler updates in background.
-/// scheduler.demonize(|_| {});
+/// scheduler.demonize(|_, _| {});
 ///
 /// // Create an exclusive task and lock scheduler's workers
 /// // from executing other tasks until this exclusive one
@@ -160,7 +160,7 @@ impl Scheduler {
     ///
     /// // Update scheduler while it's alive.
     /// while scheduler.is_alive() {
-    ///     scheduler.update(|_| {}).unwrap();
+    ///     scheduler.update(|_, _| {}).unwrap();
     /// }
     ///
     /// println!("All the tasks finished and I did not write any code to make new ones");
@@ -179,7 +179,7 @@ impl Scheduler {
     /// Create new background thread, run scheduler updates there
     /// and return context of the current scheduler to spawn new tasks,
     /// and an abort function which, when called, will stop the thread.
-    pub fn demonize(self, mut scope_handler: impl FnMut(ScopeReport) + Send + 'static) -> impl FnOnce() {
+    pub fn demonize(self, mut scope_handler: impl FnMut(ScopeReport, ScopesHandler<'_>) + Send + 'static) -> impl FnOnce() {
         let Self {
             workers,
             context,
@@ -247,7 +247,7 @@ impl Scheduler {
     /// })).unwrap();
     ///
     /// // Assign task to the worker.
-    /// scheduler.update(|_| {}).unwrap();
+    /// scheduler.update(|_, _| {}).unwrap();
     ///
     /// // Join the scheduler (wait until all the workers are closed).
     /// // We will wait until all the
@@ -269,7 +269,7 @@ impl Scheduler {
     /// because there's no mechanism which would be used
     /// by the scheduler to know that you don't want to schedule
     /// any more tasks to it in any future.
-    pub fn update(&mut self, mut scope_handler: impl FnMut(ScopeReport)) -> Result<(), SendError<(Context, Task)>> {
+    pub fn update(&mut self, mut scope_handler: impl FnMut(ScopeReport, ScopesHandler<'_>)) -> Result<(), SendError<(Context, Task)>> {
         // Listen for the task and schedule its processing.
         Self::update_for_given(
             &self.context,
@@ -300,13 +300,13 @@ impl Scheduler {
         lock_listener: &Receiver<Task>,
         workers: &[Worker],
         scope_records: &mut HashMap<Option<String>, NamedScopeRecords>,
-        scope_handler: &mut impl FnMut(ScopeReport)
+        scope_handler: &mut impl FnMut(ScopeReport, ScopesHandler<'_>)
     ) -> Result<(), SendError<(Context, Task)>> {
         /// Handle lock task with given workers and scope handler.
         fn handle_lock_task(
             workers: &[Worker],
             scope_records: &mut HashMap<Option<String>, NamedScopeRecords>,
-            scope_handler: &mut impl FnMut(ScopeReport),
+            scope_handler: &mut impl FnMut(ScopeReport, ScopesHandler<'_>),
             lock_task: Task
         ) -> Result<(), SendError<(Context, Task)>> {
             // Create new context for the in-lock tasks.
@@ -415,7 +415,7 @@ impl Scheduler {
 
     fn handle_scope_message(
         scope_records: &mut HashMap<Option<String>, NamedScopeRecords>,
-        scope_handler: &mut impl FnMut(ScopeReport),
+        scope_handler: &mut impl FnMut(ScopeReport, ScopesHandler<'_>),
         message: SchedulerScopeMessage
     ) {
         match message {
@@ -438,20 +438,40 @@ impl Scheduler {
                     }
                 }
 
-                scope_handler(report);
+                scope_handler(report, ScopesHandler(scope_records));
             }
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopesHandler<'scheduler>(&'scheduler HashMap<Option<String>, NamedScopeRecords>);
+
+impl ScopesHandler<'_> {
+    /// Get summary of the scope with the given name.
+    ///
+    /// Return `None` if scope with such name has
+    /// never existed.
+    pub fn named(&self, name: impl ToString) -> Option<ScopeSummary> {
+        let scope = self.0.get(&Some(name.to_string()))?;
+
+        Some(scope.get_summary())
+    }
+
+    // TODO
+
+    // Get summary of all the created scopes,
+    // with and without names.
+    // pub fn total(&self) -> ScopeSummary {
+
+    // }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 /// Summary information about a scope.
-pub struct ScopeInfo {
+pub struct ScopeSummary {
     /// Last reported current and total scope progress.
     pub progress: Option<(u64, u64)>,
-
-    /// Last reported scope status.
-    pub status: Option<String>,
 
     /// Progress of the scope execution.
     /// Guaranteed to be in range `[0, 1]`.
@@ -470,40 +490,7 @@ pub struct ScopeInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ScopeRecord {
     pub progress: Option<(u64, u64)>,
-    pub status: Option<String>,
     pub created_at: Instant
-}
-
-impl ScopeRecord {
-    pub fn get_summary(&self) -> ScopeInfo {
-        let fraction = self.progress.map(|(current, total)| {
-            if total == 0 {
-                0.0
-            } else if current > total {
-                1.0
-            } else {
-                current as f64 / total as f64
-            }
-        }).unwrap_or(0.0);
-
-        let elapsed_time = self.created_at.elapsed();
-
-        let estimate_time = if fraction > 0.0 {
-            let estimate_time = elapsed_time.as_millis() as f64 / fraction;
-
-            Duration::from_millis(estimate_time as u64)
-        } else {
-            Duration::default()
-        };
-
-        ScopeInfo {
-            progress: self.progress,
-            status: self.status.clone(),
-            fraction,
-            elapsed_time,
-            estimate_time
-        }
-    }
 }
 
 impl Default for ScopeRecord {
@@ -511,7 +498,6 @@ impl Default for ScopeRecord {
     fn default() -> Self {
         Self {
             progress: None,
-            status: None,
             created_at: Instant::now()
         }
     }
@@ -584,6 +570,37 @@ impl NamedScopeRecords {
     pub fn remove(&mut self, id: u64) {
         self.records.remove(id);
     }
+
+    #[inline]
+    /// Get summary of the current named scope.
+    pub fn get_summary(&self) -> ScopeSummary {
+        let fraction = self.progress.map(|(current, total)| {
+            if total == 0 {
+                0.0
+            } else if current > total {
+                1.0
+            } else {
+                current as f64 / total as f64
+            }
+        }).unwrap_or(0.0);
+
+        let elapsed_time = self.created_at.elapsed();
+
+        let estimate_time = if fraction > 0.0 {
+            let estimate_time = elapsed_time.as_millis() as f64 / fraction;
+
+            Duration::from_millis(estimate_time as u64)
+        } else {
+            Duration::default()
+        };
+
+        ScopeSummary {
+            progress: self.progress,
+            fraction,
+            elapsed_time,
+            estimate_time
+        }
+    }
 }
 
 impl Default for NamedScopeRecords {
@@ -610,7 +627,7 @@ fn test_scheduling() {
         while !recv.is_full() {
             let send = send.clone();
 
-            scheduler.update(move |report| {
+            scheduler.update(move |report, _| {
                 if let ScopeReport::Progress { total, .. } = report {
                     let _ = send.send(total);
                 }
