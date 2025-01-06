@@ -513,7 +513,7 @@ struct NamedScopeRecords {
 impl NamedScopeRecords {
     /// Insert record info to the current named scope.
     pub fn insert(&mut self, id: u64, record: ScopeRecord) {
-        // Update named scope's current and total progress.
+        // Update previous stored stats of this record and update progress value.
         if let Some(prev_record) = self.records.remove(id) {
             if let Some((current, total)) = &mut self.progress {
                 // Substract previous progress of this record.
@@ -530,6 +530,19 @@ impl NamedScopeRecords {
             } else {
                 self.progress = record.progress;
             }
+        }
+
+        // Insert new record and update progress value.
+        else if let Some((current, total)) = &mut self.progress {
+            if let Some((new_current, new_total)) = &record.progress {
+                *current += *new_current;
+                *total += *new_total;
+            }
+        }
+
+        // Insert new record.
+        else {
+            self.progress = record.progress;
         }
 
         // Update named scope's creation time.
@@ -701,11 +714,14 @@ fn test_scopes_summary() {
             scope.progress(2, 3).unwrap();
             scope.progress(3, 4).unwrap();
             scope.progress(4, 5).unwrap();
+
+            scope.finish(5);
         });
     })).unwrap();
 
     // (report_progress, summary_progress)
     let mut expected_values = vec![
+        ((5, 5), (12, 15)),
         ((4, 5), (11, 15)),
         ((3, 4), (10, 14)),
         ((2, 3), (9,  13)),
