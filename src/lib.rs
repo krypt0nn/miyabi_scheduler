@@ -1,27 +1,216 @@
 use std::cell::Cell;
 use std::thread::JoinHandle;
+use std::time::{Instant, Duration};
+use std::collections::HashMap;
 
 use flume::{Sender, Receiver, SendError};
+use intmap::IntMap;
 
 /// General task type which can be executed by the worker.
 pub type Task = Box<dyn FnOnce(Context) + Send + 'static>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedScopeRecords {
+    progress: Option<(u64, u64)>,
+    created_at: Instant,
+    records: IntMap<u64, ScopeRecord>
+}
+
+impl NamedScopeRecords {
+    /// Insert record info to the current named scope.
+    pub fn insert(&mut self, id: u64, record: ScopeRecord) {
+        // Update named scope's current and total progress.
+        if let Some(prev_record) = self.records.remove(id) {
+            if let Some((current, total)) = &mut self.progress {
+                // Substract previous progress of this record.
+                if let Some((prev_current, prev_total)) = prev_record.progress {
+                    *current -= prev_current;
+                    *total -= prev_total;
+                }
+
+                // Add new progress of this record.
+                if let Some((new_current, new_total)) = &record.progress {
+                    *current += *new_current;
+                    *total += *new_total;
+                }
+            } else {
+                self.progress = record.progress;
+            }
+        }
+
+        // Update named scope's creation time.
+        if record.created_at < self.created_at {
+            self.created_at = record.created_at;
+        }
+
+        // Insert the record.
+        self.records.insert(id, record);
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    /// Update progress of the scope with the given id.
+    pub fn update_progress(&mut self, id: u64, current: u64, total: u64) {
+        if let Some(mut prev_record) = self.records.remove(id) {
+            if let Some((prev_current, prev_total)) = &mut prev_record.progress {
+                *prev_current = current;
+                *prev_total = total;
+            } else {
+                prev_record.progress = Some((current, total));
+            }
+
+            self.insert(id, prev_record);
+        } else {
+            let mut record = ScopeRecord::default();
+
+            record.progress = Some((current, total));
+
+            self.insert(id, record);
+        }
+    }
+
+    #[inline]
+    /// Remove record from the named scope.
+    ///
+    /// This method will free the memory but keep
+    /// already calculated summary values.
+    pub fn remove(&mut self, id: u64) {
+        self.records.remove(id);
+    }
+}
+
+impl Default for NamedScopeRecords {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            progress: None,
+            created_at: Instant::now(),
+            records: IntMap::new()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ScopeRecord {
+    pub progress: Option<(u64, u64)>,
+    pub status: Option<String>,
+    pub created_at: Instant
+}
+
+impl ScopeRecord {
+    pub fn get_summary(&self) -> ScopeInfo {
+        let fraction = self.progress.map(|(current, total)| {
+            if total == 0 {
+                0.0
+            } else if current > total {
+                1.0
+            } else {
+                current as f64 / total as f64
+            }
+        }).unwrap_or(0.0);
+
+        let elapsed_time = self.created_at.elapsed();
+
+        let estimate_time = if fraction > 0.0 {
+            let estimate_time = elapsed_time.as_millis() as f64 / fraction;
+
+            Duration::from_millis(estimate_time as u64)
+        } else {
+            Duration::default()
+        };
+
+        ScopeInfo {
+            progress: self.progress,
+            status: self.status.clone(),
+            fraction,
+            elapsed_time,
+            estimate_time
+        }
+    }
+}
+
+impl Default for ScopeRecord {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            progress: None,
+            status: None,
+            created_at: Instant::now()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Summary information about a scope.
+pub struct ScopeInfo {
+    /// Last reported current and total scope progress.
+    pub progress: Option<(u64, u64)>,
+
+    /// Last reported scope status.
+    pub status: Option<String>,
+
+    /// Progress of the scope execution.
+    /// Guaranteed to be in range `[0, 1]`.
+    /// Defaults to 0.
+    pub fraction: f64,
+
+    /// Time elapsed since the first report was sent from the scope.
+    /// Defaults to 0.
+    pub elapsed_time: Duration,
+
+    /// Estimation of how long it will take to finish the scope.
+    /// Defaults to 0.
+    pub estimate_time: Duration
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SchedulerScopeMessage {
+    Create {
+        id: u64,
+        name: Option<String>
+    },
+
+    Drop {
+        id: u64,
+        name: Option<String>
+    },
+
+    Update(ScopeReport)
+}
+
+impl From<ScopeReport> for SchedulerScopeMessage {
+    #[inline]
+    fn from(value: ScopeReport) -> Self {
+        Self::Update(value)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// Report sent from the task's scope.
 pub enum ScopeReport {
     Progress {
+        id: u64,
         name: Option<String>,
         current: u64,
         total: u64
     },
 
     Status {
+        id: u64,
         name: Option<String>,
         status: String
     }
 }
 
 impl ScopeReport {
+    #[inline]
+    /// Get id of the report's scope.
+    pub const fn id(&self) -> u64 {
+        match self {
+            Self::Progress { id, .. } |
+            Self::Status { id, .. } => *id
+        }
+    }
+
     #[inline]
     /// Get name of the report's scope.
     pub const fn name(&self) -> Option<&String> {
@@ -60,25 +249,44 @@ impl ScopeReport {
 /// scope.finish(100);
 /// ```
 pub struct Scope<'context> {
+    id: u64,
     name: Option<String>,
-    sender: &'context Sender<ScopeReport>,
+    sender: &'context Sender<SchedulerScopeMessage>,
     last_total: Cell<Option<u64>>
 }
 
-impl Scope<'_> {
+impl<'context> Scope<'context> {
+    /// Create new scope with given name and sender.
+    pub fn create(name: Option<String>, sender: &'context Sender<SchedulerScopeMessage>) -> Self {
+        let id = fastrand::u64(..);
+
+        let _ = sender.send(SchedulerScopeMessage::Create {
+            id,
+            name: name.clone()
+        });
+
+        Self {
+            id: fastrand::u64(..),
+            name,
+            sender,
+            last_total: Cell::new(None)
+        }
+    }
+
     /// Report back progress update within the current scope.
     ///
     /// Reports are handled by the scheduler. Return error if
     /// report couldn't be sent. This generally means that the
     /// scheduler is closed.
-    pub fn progress(&self, current: u64, total: u64) -> Result<(), SendError<ScopeReport>> {
+    pub fn progress(&self, current: u64, total: u64) -> Result<(), SendError<SchedulerScopeMessage>> {
         self.last_total.set(Some(total));
 
         self.sender.send(ScopeReport::Progress {
+            id: self.id,
             name: self.name.clone(),
             current,
             total
-        })
+        }.into())
     }
 
     /// Report back status update within the current scope.
@@ -86,11 +294,12 @@ impl Scope<'_> {
     /// Reports are handled by the scheduler. Return error if
     /// report couldn't be sent. This generally means that the
     /// scheduler is closed.
-    pub fn status(&self, status: impl ToString) -> Result<(), SendError<ScopeReport>> {
+    pub fn status(&self, status: impl ToString) -> Result<(), SendError<SchedulerScopeMessage>> {
         self.sender.send(ScopeReport::Status {
+            id: self.id,
             name: self.name.clone(),
             status: status.to_string()
-        })
+        }.into())
     }
 
     /// Report finished progress of the scope.
@@ -99,23 +308,39 @@ impl Scope<'_> {
     pub fn finish(mut self, finished: u64) {
         self.last_total.set(None);
 
+        let name = self.name.take();
+
         let _ = self.sender.send(ScopeReport::Progress {
-            name: self.name.take(),
+            id: self.id,
+            name: name.clone(),
             current: finished,
             total: finished
+        }.into());
+
+        let _ = self.sender.send(SchedulerScopeMessage::Drop {
+            id: self.id,
+            name
         });
     }
 }
 
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
+        let name = self.name.take();
+
         if let Some(last_total) = self.last_total.take() {
             let _ = self.sender.send(ScopeReport::Progress {
-                name: self.name.take(),
+                id: self.id,
+                name: name.clone(),
                 current: last_total,
                 total: last_total
-            });
+            }.into());
         }
+
+        let _ = self.sender.send(SchedulerScopeMessage::Drop {
+            id: self.id,
+            name
+        });
     }
 }
 
@@ -151,13 +376,13 @@ impl Drop for Scope<'_> {
 pub struct Context {
     task_sender: Sender<Task>,
     lock_sender: Sender<Task>,
-    scope_sender: Sender<ScopeReport>
+    scope_sender: Sender<SchedulerScopeMessage>
 }
 
 impl Context {
     /// Create new context and return task and lock listeners,
     /// and listener of the scope progress reports.
-    pub fn new() -> (Self, Receiver<Task>, Receiver<Task>, Receiver<ScopeReport>) {
+    pub fn new() -> (Self, Receiver<Task>, Receiver<Task>, Receiver<SchedulerScopeMessage>) {
         let (task_sender, task_listener) = flume::bounded(1);
         let (lock_sender, lock_listener) = flume::bounded(1);
         let (scope_sender, scope_listener) = flume::unbounded();
@@ -201,6 +426,7 @@ impl Context {
     /// in the scheduler.
     pub fn scope<T>(&self, callback: impl FnOnce(Scope) -> T) -> T {
         callback(Scope {
+            id: fastrand::u64(..),
             name: None,
             sender: &self.scope_sender,
             last_total: Cell::new(None)
@@ -214,6 +440,7 @@ impl Context {
     /// in the scheduler.
     pub fn named_scope<T>(&self, name: impl ToString, callback: impl FnOnce(Scope) -> T) -> T {
         callback(Scope {
+            id: fastrand::u64(..),
             name: Some(name.to_string()),
             sender: &self.scope_sender,
             last_total: Cell::new(None)
@@ -341,8 +568,11 @@ impl Worker {
 /// // Scheduler with 2 workers and 4 tasks queue size in each.
 /// let scheduler = Scheduler::new(2, 4);
 ///
+/// // Obtain the scheduler's context to spawn new tasks.
+/// let context = scheduler.context();
+///
 /// // Run scheduler updates in background.
-/// let (context, _) = scheduler.demonize(|_| {});
+/// scheduler.demonize(|_| {});
 ///
 /// // Create an exclusive task and lock scheduler's workers
 /// // from executing other tasks until this exclusive one
@@ -374,7 +604,8 @@ pub struct Scheduler {
     context: Context,
     task_listener: Receiver<Task>,
     lock_listener: Receiver<Task>,
-    scope_listener: Receiver<ScopeReport>
+    scope_listener: Receiver<SchedulerScopeMessage>,
+    scope_records: HashMap<Option<String>, NamedScopeRecords>
 }
 
 impl Scheduler {
@@ -399,7 +630,8 @@ impl Scheduler {
             context,
             task_listener,
             lock_listener,
-            scope_listener
+            scope_listener,
+            scope_records: HashMap::new()
         }
     }
 
@@ -456,7 +688,7 @@ impl Scheduler {
     /// use miyabi_scheduler::*;
     ///
     /// // Create new scheduler with 1 worker.
-    /// let scheduler = Scheduler::new(1, 2);
+    /// let mut scheduler = Scheduler::new(1, 2);
     ///
     /// // Schedule it to execute this task (wait 1 second).
     /// scheduler.schedule(Box::new(|_| {
@@ -484,16 +716,15 @@ impl Scheduler {
     /// Create new background thread, run scheduler updates there
     /// and return context of the current scheduler to spawn new tasks,
     /// and an abort function which, when called, will stop the thread.
-    pub fn demonize(self, mut scope_handler: impl FnMut(ScopeReport) + Send + 'static) -> (Context, impl FnOnce()) {
+    pub fn demonize(self, mut scope_handler: impl FnMut(ScopeReport) + Send + 'static) -> impl FnOnce() {
         let Self {
             workers,
             context,
             task_listener,
             lock_listener,
-            scope_listener
+            scope_listener,
+            mut scope_records
         } = self;
-
-        let demon_context = context.clone();
 
         let (send, recv) = flume::bounded(1);
 
@@ -507,17 +738,26 @@ impl Scheduler {
                     break;
                 }
 
-                if Self::update_for_given(&demon_context, &task_listener, &lock_listener, &workers, &mut scope_handler).is_err() {
+                let result = Self::update_for_given(
+                    &context,
+                    &task_listener,
+                    &lock_listener,
+                    &workers,
+                    &mut scope_records,
+                    &mut scope_handler
+                );
+
+                if result.is_err() {
                     break;
                 }
 
-                while let Ok(report) = scope_listener.try_recv() {
-                    scope_handler(report);
+                while let Ok(message) = scope_listener.try_recv() {
+                    Self::handle_scope_message(&mut scope_records, &mut scope_handler, message);
                 }
             }
         });
 
-        (context, abort)
+        abort
     }
 
     #[inline]
@@ -536,7 +776,7 @@ impl Scheduler {
     /// use miyabi_scheduler::*;
     ///
     /// // Create new scheduler with 1 worker.
-    /// let scheduler = Scheduler::new(1, 1);
+    /// let mut scheduler = Scheduler::new(1, 1);
     ///
     /// // Schedule task execution (wait for 1 second).
     /// scheduler.schedule(Box::new(|_| {
@@ -566,13 +806,20 @@ impl Scheduler {
     /// because there's no mechanism which would be used
     /// by the scheduler to know that you don't want to schedule
     /// any more tasks to it in any future.
-    pub fn update(&self, mut scope_handler: impl FnMut(ScopeReport)) -> Result<(), SendError<(Context, Task)>> {
+    pub fn update(&mut self, mut scope_handler: impl FnMut(ScopeReport)) -> Result<(), SendError<(Context, Task)>> {
         // Listen for the task and schedule its processing.
-        Self::update_for_given(&self.context, &self.task_listener, &self.lock_listener, &self.workers, &mut scope_handler)?;
+        Self::update_for_given(
+            &self.context,
+            &self.task_listener,
+            &self.lock_listener,
+            &self.workers,
+            &mut self.scope_records,
+            &mut scope_handler
+        )?;
 
         // Handle all the reports generated by the task.
-        while let Ok(report) = self.scope_listener.try_recv() {
-            scope_handler(report);
+        while let Ok(message) = self.scope_listener.try_recv() {
+            Self::handle_scope_message(&mut self.scope_records, &mut scope_handler, message);
         }
 
         Ok(())
@@ -589,11 +836,13 @@ impl Scheduler {
         task_listener: &Receiver<Task>,
         lock_listener: &Receiver<Task>,
         workers: &[Worker],
+        scope_records: &mut HashMap<Option<String>, NamedScopeRecords>,
         scope_handler: &mut impl FnMut(ScopeReport)
     ) -> Result<(), SendError<(Context, Task)>> {
         /// Handle lock task with given workers and scope handler.
         fn handle_lock_task(
             workers: &[Worker],
+            scope_records: &mut HashMap<Option<String>, NamedScopeRecords>,
             scope_handler: &mut impl FnMut(ScopeReport),
             lock_task: Task
         ) -> Result<(), SendError<(Context, Task)>> {
@@ -614,11 +863,11 @@ impl Scheduler {
 
             // Listen for the tasks from within the lock until it's fully executed.
             while !thread.is_finished() || !new_task_listener.is_empty() || !new_lock_listener.is_empty() {
-                Scheduler::update_for_given(&new_context, &new_task_listener, &new_lock_listener, workers, scope_handler)?;
+                Scheduler::update_for_given(&new_context, &new_task_listener, &new_lock_listener, workers, scope_records, scope_handler)?;
 
                 // Handle all the reports generated by the tasks.
-                while let Ok(report) = new_scope_listener.try_recv() {
-                    scope_handler(report);
+                while let Ok(message) = new_scope_listener.try_recv() {
+                    Scheduler::handle_scope_message(scope_records, scope_handler, message);
                 }
             }
 
@@ -626,8 +875,8 @@ impl Scheduler {
             // until the sender is dropped by the task.
             drop(new_context);
 
-            while let Ok(report) = new_scope_listener.recv() {
-                scope_handler(report);
+            while let Ok(message) = new_scope_listener.recv() {
+                Scheduler::handle_scope_message(scope_records, scope_handler, message);
             }
 
             Ok(())
@@ -674,7 +923,7 @@ impl Scheduler {
             let mut tasks = Vec::from_iter(task_listener.drain());
 
             // Process the lock task.
-            handle_lock_task(workers, scope_handler, lock_task)?;
+            handle_lock_task(workers, scope_records, scope_handler, lock_task)?;
 
             // Process following locks and tasks.
             //
@@ -685,7 +934,7 @@ impl Scheduler {
             // 2. The fact that the context's buffer is limited to only 1 task at a time.
 
             for lock_task in lock_tasks.drain(..) {
-                handle_lock_task(workers, scope_handler, lock_task)?;
+                handle_lock_task(workers, scope_records, scope_handler, lock_task)?;
             }
 
             for task in tasks.drain(..) {
@@ -700,11 +949,41 @@ impl Scheduler {
 
         Ok(())
     }
+
+    fn handle_scope_message(
+        scope_records: &mut HashMap<Option<String>, NamedScopeRecords>,
+        scope_handler: &mut impl FnMut(ScopeReport),
+        message: SchedulerScopeMessage
+    ) {
+        match message {
+            SchedulerScopeMessage::Create { id, name } => {
+                scope_records.entry(name)
+                    .or_default()
+                    .insert(id, ScopeRecord::default());
+            }
+
+            SchedulerScopeMessage::Drop { id, name } => {
+                if let Some(named_scope) = scope_records.get_mut(&name) {
+                    named_scope.remove(id);
+                }
+            }
+
+            SchedulerScopeMessage::Update(report) => {
+                if let ScopeReport::Progress { id, name, current, total } = &report {
+                    if let Some(named_scope) = scope_records.get_mut(name) {
+                        named_scope.update_progress(*id, *current, *total);
+                    }
+                }
+
+                scope_handler(report);
+            }
+        }
+    }
 }
 
 #[test]
 fn test_scheduling() {
-    let scheduler = Scheduler::new(1, 4);
+    let mut scheduler = Scheduler::new(1, 4);
 
     // Start background thread to listen for incoming tasks.
     let context = scheduler.context();

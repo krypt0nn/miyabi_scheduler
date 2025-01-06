@@ -12,3 +12,5 @@ edition = "2021"
 
 [dependencies]
 flume = "0.11"
+fastrand = "2.3"
+intmap = "3.0"
