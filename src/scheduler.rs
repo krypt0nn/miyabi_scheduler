@@ -559,14 +559,37 @@ impl NamedScopeRecords {
     pub fn update_progress(&mut self, id: u64, current: u64, total: u64) {
         if let Some(mut prev_record) = self.records.remove(id) {
             if let Some((prev_current, prev_total)) = &mut prev_record.progress {
+                if let Some((summary_current, summary_total)) = &mut self.progress {
+                    *summary_current -= *prev_current;
+                    *summary_total -= *prev_total;
+                }
+
                 *prev_current = current;
                 *prev_total = total;
-            } else {
+
+                if let Some((summary_current, summary_total)) = &mut self.progress {
+                    *summary_current += *prev_current;
+                    *summary_total += *prev_total;
+                } else {
+                    self.progress = Some((*prev_current, *prev_total));
+                }
+            }
+
+            else {
+                if let Some((summary_current, summary_total)) = &mut self.progress {
+                    *summary_current += current;
+                    *summary_total += total;
+                } else {
+                    self.progress = Some((current, total));
+                }
+
                 prev_record.progress = Some((current, total));
             }
 
-            self.insert(id, prev_record);
-        } else {
+            self.records.insert(id, prev_record);
+        }
+
+        else {
             let mut record = ScopeRecord::default();
 
             record.progress = Some((current, total));
