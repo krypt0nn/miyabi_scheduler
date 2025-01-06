@@ -45,7 +45,7 @@ scheduler *again* and process 4 and 5. Then, once 3's context is dropped,
 unlock second lock and continue processing 6. Then unlock 2's lock and
 continue processing 7 and 8.
 
-*Named after the [Hoshimi Miyabi](https://zenless-zone-zero.fandom.com/wiki/Hoshimi_Miyabi) from Zenless Zone Zero 🙏*
+*Named after [Hoshimi Miyabi](https://zenless-zone-zero.fandom.com/wiki/Hoshimi_Miyabi) from Zenless Zone Zero 🙏*
 
 <img src="./images/miyabi.png">
 
