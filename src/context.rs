@@ -15,7 +15,7 @@ use super::prelude::*;
 /// use miyabi_scheduler::prelude::*;
 ///
 /// // Create new context and drop all the listeners meant for the scheduler.
-/// let (context, _, _, _) = Context::new();
+/// let (context, _, _, _) = Context::new(1);
 ///
 /// // Schedule some task.
 /// context.schedule(Box::new(|new_context: Context| {
@@ -42,9 +42,9 @@ pub struct Context {
 impl Context {
     /// Create new context and return task and lock listeners,
     /// and listener of the scope progress reports.
-    pub fn new() -> (Self, Receiver<Task>, Receiver<Task>, Receiver<SchedulerScopeMessage>) {
-        let (task_sender, task_listener) = flume::bounded(1);
-        let (lock_sender, lock_listener) = flume::bounded(1);
+    pub fn new(queue_size: usize) -> (Self, Receiver<Task>, Receiver<Task>, Receiver<SchedulerScopeMessage>) {
+        let (task_sender, task_listener) = flume::bounded(queue_size);
+        let (lock_sender, lock_listener) = flume::bounded(queue_size);
         let (scope_sender, scope_listener) = flume::unbounded();
 
         let context = Self {

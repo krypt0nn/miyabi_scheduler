@@ -86,7 +86,7 @@ impl Scheduler {
             task_listener,
             lock_listener,
             scope_listener
-        ) = Context::new();
+        ) = Context::new(workers_num * worker_queue_size);
 
         Self {
             workers,
@@ -315,7 +315,7 @@ impl Scheduler {
                 new_task_listener,
                 new_lock_listener,
                 new_scope_listener
-            ) = Context::new();
+            ) = Context::new(workers.len());
 
             // Spawn lock task in a new thread to not to block workers of the scheduler.
             let thread = {
@@ -665,4 +665,68 @@ fn test_scheduling() {
     })).unwrap();
 
     handle.join().unwrap();
+}
+
+#[test]
+fn test_scopes_summary() {
+    let mut scheduler = Scheduler::new(3, 1);
+
+    scheduler.schedule(Box::new(|context| {
+        context.named_scope("test_scope", |scope| {
+            scope.progress(1, 5).unwrap();
+
+            std::thread::sleep(std::time::Duration::from_micros(200));
+
+            scope.progress(3, 5).unwrap();
+        });
+    })).unwrap();
+
+    scheduler.schedule(Box::new(|context| {
+        context.named_scope("test_scope", |scope| {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+
+            scope.progress(2, 5).unwrap();
+
+            std::thread::sleep(std::time::Duration::from_micros(100));
+
+            scope.progress(4, 5).unwrap();
+        });
+    })).unwrap();
+
+    scheduler.schedule(Box::new(|context| {
+        context.named_scope("test_scope", |scope| {
+            std::thread::sleep(std::time::Duration::from_micros(500));
+
+            scope.progress(1, 2).unwrap();
+            scope.progress(2, 3).unwrap();
+            scope.progress(3, 4).unwrap();
+            scope.progress(4, 5).unwrap();
+        });
+    })).unwrap();
+
+    // (report_progress, summary_progress)
+    let mut expected_values = vec![
+        ((4, 5), (11, 15)),
+        ((3, 4), (10, 14)),
+        ((2, 3), (9,  13)),
+        ((1, 2), (8,  12)),
+        ((4, 5), (7,  10)),
+        ((3, 5), (5,  10)),
+        ((2, 5), (3,  10)),
+        ((1, 5), (1,  5))
+    ];
+
+    while let Some((expected_report, expected_summary)) = expected_values.pop() {
+        scheduler.update(|report, handler| {
+            let ScopeReport::Progress { current, total, .. } = report else {
+                panic!("Progress report expected, got {report:?}");
+            };
+
+            assert_eq!((current, total), expected_report);
+
+            let summary = handler.named("test_scope").unwrap();
+
+            assert_eq!(summary.progress, Some(expected_summary));
+        }).unwrap();
+    }
 }

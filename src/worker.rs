@@ -17,7 +17,7 @@ use super::prelude::*;
 /// use miyabi_scheduler::prelude::*;
 ///
 /// // Create new context and drop all the listeners.
-/// let (context, _, _, _) = Context::new();
+/// let (context, _, _, _) = Context::new(1);
 ///
 /// // Create new worker which can store up to 10 tasks.
 /// let worker = Worker::new(10);
