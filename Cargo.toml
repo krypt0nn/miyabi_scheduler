@@ -14,3 +14,7 @@ edition = "2021"
 flume = { version = "0.11", default-features = false, features = ["spin"] }
 fastrand = "2.3"
 intmap = "3.0"
+
+[[example]]
+name = "find_substring"
+path = "examples/find_substring.rs"
