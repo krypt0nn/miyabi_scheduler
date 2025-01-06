@@ -1,6 +1,6 @@
 [package]
 name = "miyabi_scheduler"
-version = "0.2.0"
+version = "0.2.1"
 description = "Thread pool scheduler with extra specific abilities"
 keywords = ["threads", "thread-pool", "scheduler"]
 categories = ["concurrency"]
