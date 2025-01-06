@@ -11,6 +11,6 @@ license = "MIT"
 edition = "2021"
 
 [dependencies]
-flume = "0.11"
+flume = { version = "0.11", default-features = false, features = ["spin"] }
 fastrand = "2.3"
 intmap = "3.0"
